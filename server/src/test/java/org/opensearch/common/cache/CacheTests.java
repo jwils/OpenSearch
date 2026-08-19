@@ -1185,6 +1185,59 @@ public class CacheTests extends OpenSearchTestCase {
         assertEquals(0L, cache.weight());
     }
 
+    /** As {@link #testKeyedRemovalNotifiesOutsideLruLock}, for the entries that {@link Cache#refresh()} evicts. */
+    public void testEvictionNotifiesOutsideLruLock() throws Exception {
+        final AtomicReference<Cache<String, String>> cacheRef = new AtomicReference<>();
+        final AtomicBoolean lruLockWasFree = new AtomicBoolean();
+        final AtomicBoolean probed = new AtomicBoolean();
+        final AtomicInteger notifications = new AtomicInteger();
+
+        final Cache<String, String> cache = CacheBuilder.<String, String>builder().setMaximumWeight(10).removalListener(notification -> {
+            notifications.incrementAndGet();
+            // only the first notification probes the lock, so that the probe cannot recurse through the
+            // evictions that it triggers itself
+            if (probed.compareAndSet(false, true)) {
+                lruLockWasFree.set(lruLockIsFree(cacheRef.get()));
+            }
+        }).build();
+        cacheRef.set(cache);
+
+        cache.put("a", "1");
+        cache.put("b", "2");
+        cache.put("c", "3");
+        assertEquals("nothing should have been evicted yet", 0, notifications.get());
+
+        // the cache is over weight from here on, so refresh() has to evict
+        cache.setMaximumWeight(1);
+        cache.refresh();
+
+        assertEquals("the entries over the maximum weight should have been evicted", 2, notifications.get());
+        assertTrue("the removal listener should not hold the LRU lock", lruLockWasFree.get());
+    }
+
+    /** As {@link #testKeyedRemovalNotifiesOutsideLruLock}, for {@link Cache#keys()} iterator removal. */
+    public void testIteratorRemovalNotifiesOutsideLruLock() throws Exception {
+        final AtomicReference<Cache<String, String>> cacheRef = new AtomicReference<>();
+        final AtomicBoolean lruLockWasFree = new AtomicBoolean();
+        final AtomicInteger notifications = new AtomicInteger();
+
+        final Cache<String, String> cache = CacheBuilder.<String, String>builder().removalListener(notification -> {
+            notifications.incrementAndGet();
+            lruLockWasFree.set(lruLockIsFree(cacheRef.get()));
+        }).build();
+        cacheRef.set(cache);
+
+        cache.put("key", "value");
+        Iterator<String> iterator = cache.keys().iterator();
+        iterator.next();
+        iterator.remove();
+
+        assertEquals("the removal listener should have been notified", 1, notifications.get());
+        assertTrue("the removal listener should not hold the LRU lock", lruLockWasFree.get());
+        assertEquals(0, cache.count());
+        assertEquals(List.of(), lruKeys(cache));
+    }
+
     /**
      * True if the calling thread does not hold the LRU lock: another thread can take that lock, and so mutate the
      * cache, while this thread waits.

@@ -416,12 +416,7 @@ public class Cache<K, V> {
         if (entry == null) {
             return null;
         } else {
-            List<RemovalNotification<K, V>> removalNotifications = promote(entry, now).v2();
-            if (!removalNotifications.isEmpty()) {
-                for (RemovalNotification<K, V> removalNotification : removalNotifications) {
-                    removalListener.onRemoval(removalNotification);
-                }
-            }
+            notifyRemovals(promote(entry, now).v2());
             return entry.value;
         }
     }
@@ -444,9 +439,11 @@ public class Cache<K, V> {
         long now = now();
         // we have to eagerly evict expired entries or our putIfAbsent call below will fail
         V value = get(key, now, e -> {
+            final RemovalNotification<K, V> removalNotification;
             try (ReleasableLock ignored = lruLock.acquire()) {
-                evictEntry(e);
+                removalNotification = evictEntry(e);
             }
+            notifyRemoval(removalNotification);
         });
         if (value == null) {
             value = compute(key, loader);
@@ -471,15 +468,7 @@ public class Cache<K, V> {
 
         BiFunction<? super Entry<K, V>, Throwable, ? extends V> handler = (ok, ex) -> {
             if (ok != null) {
-                List<RemovalNotification<K, V>> removalNotifications = new ArrayList<>();
-                try (ReleasableLock ignored = lruLock.acquire()) {
-                    removalNotifications = promote(ok, now).v2();
-                }
-                if (!removalNotifications.isEmpty()) {
-                    for (RemovalNotification<K, V> removalNotification : removalNotifications) {
-                        removalListener.onRemoval(removalNotification);
-                    }
-                }
+                notifyRemovals(promote(ok, now).v2());
                 return ok.value;
             } else {
                 try (ReleasableLock ignored = segment.writeLock.acquire()) {
@@ -555,11 +544,7 @@ public class Cache<K, V> {
         if (replaced) {
             removalNotifications.add(new RemovalNotification<>(tuple.v2().key, tuple.v2().value, RemovalReason.REPLACED));
         }
-        if (!removalNotifications.isEmpty()) {
-            for (RemovalNotification<K, V> removalNotification : removalNotifications) {
-                removalListener.onRemoval(removalNotification);
-            }
-        }
+        notifyRemovals(removalNotifications);
     }
 
     private final Consumer<CompletableFuture<Entry<K, V>>> invalidationConsumer = f -> deleteWhenLoaded(f, RemovalReason.INVALIDATED);
@@ -626,7 +611,30 @@ public class Cache<K, V> {
         try (ReleasableLock ignored = lruLock.acquire()) {
             removalNotification = detach(entry, removalReason);
         }
+        notifyRemoval(removalNotification);
+    }
+
+    /**
+     * Issue a removal notification for an entry that is already detached from the LRU list. Callers release the LRU
+     * lock first: the removal listener is caller-supplied code of unknown cost, and that lock is a single lock that
+     * every mutation of the cache has to take.
+     *
+     * @param removalNotification the notification to issue, or null if there is nothing to report
+     */
+    private void notifyRemoval(RemovalNotification<K, V> removalNotification) {
         if (removalNotification != null) {
+            removalListener.onRemoval(removalNotification);
+        }
+    }
+
+    /**
+     * Issue the removal notifications for entries that are already detached from the LRU list, under the same
+     * condition as {@link #notifyRemoval}.
+     *
+     * @param removalNotifications the notifications to issue
+     */
+    private void notifyRemovals(List<RemovalNotification<K, V>> removalNotifications) {
+        for (RemovalNotification<K, V> removalNotification : removalNotifications) {
             removalListener.onRemoval(removalNotification);
         }
     }
@@ -715,9 +723,11 @@ public class Cache<K, V> {
      */
     public void refresh() {
         long now = now();
+        final List<RemovalNotification<K, V>> removalNotifications;
         try (ReleasableLock ignored = lruLock.acquire()) {
-            evict(now);
+            removalNotifications = evict(now);
         }
+        notifyRemovals(removalNotifications);
     }
 
     /**
@@ -841,10 +851,12 @@ public class Cache<K, V> {
             if (entry != null) {
                 CacheSegment<K, V> segment = getCacheSegment(entry.key);
                 segment.remove(entry.key, entry.value, f -> {});
+                final RemovalNotification<K, V> removalNotification;
                 try (ReleasableLock ignored = lruLock.acquire()) {
                     current = null;
-                    delete(entry, RemovalReason.INVALIDATED);
+                    removalNotification = detach(entry, RemovalReason.INVALIDATED);
                 }
+                notifyRemoval(removalNotification);
             }
         }
     }
@@ -972,48 +984,46 @@ public class Cache<K, V> {
                     break;
             }
             if (promoted) {
-                while (tail != null && shouldPrune(tail, now)) {
-                    Entry<K, V> entryToBeRemoved = tail;
-                    CacheSegment<K, V> segment = getCacheSegment(entryToBeRemoved.key);
-                    if (segment != null) {
-                        segment.remove(entryToBeRemoved.key, entryToBeRemoved.value, f -> {});
-                    }
-                    if (unlink(entryToBeRemoved)) {
-                        removalNotifications.add(
-                            new RemovalNotification<>(entryToBeRemoved.key, entryToBeRemoved.value, RemovalReason.EVICTED)
-                        );
-                    }
-                }
+                removalNotifications = evict(now);
             }
         }
         return new Tuple<>(promoted, removalNotifications);
     }
 
-    private void evict(long now) {
+    /**
+     * Evict every entry that has to be pruned, and return the notifications the caller has to issue once it
+     * releases the LRU lock.
+     *
+     * @param now the current time
+     * @return the notifications for the evicted entries
+     */
+    private List<RemovalNotification<K, V>> evict(long now) {
         assert lruLock.isHeldByCurrentThread();
 
+        List<RemovalNotification<K, V>> removalNotifications = new ArrayList<>();
         while (tail != null && shouldPrune(tail, now)) {
-            evictEntry(tail);
+            RemovalNotification<K, V> removalNotification = evictEntry(tail);
+            if (removalNotification != null) {
+                removalNotifications.add(removalNotification);
+            }
         }
+        return removalNotifications;
     }
 
-    private void evictEntry(Entry<K, V> entry) {
+    /**
+     * Evict a single entry, and return the notification the caller has to issue once it releases the LRU lock.
+     *
+     * @param entry the entry to evict
+     * @return the notification for the entry, or null if another thread already removed it
+     */
+    private RemovalNotification<K, V> evictEntry(Entry<K, V> entry) {
         assert lruLock.isHeldByCurrentThread();
 
         CacheSegment<K, V> segment = getCacheSegment(entry.key);
         if (segment != null) {
             segment.remove(entry.key, entry.value, f -> {});
         }
-        delete(entry, RemovalReason.EVICTED);
-    }
-
-    private void delete(Entry<K, V> entry, RemovalReason removalReason) {
-        assert lruLock.isHeldByCurrentThread();
-
-        RemovalNotification<K, V> removalNotification = detach(entry, removalReason);
-        if (removalNotification != null) {
-            removalListener.onRemoval(removalNotification);
-        }
+        return detach(entry, RemovalReason.EVICTED);
     }
 
     /**
